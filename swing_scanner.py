@@ -27,13 +27,7 @@ ATR_STOP_MULT = 1.5    # stop = entry - 1.5 * ATR
 VOL_SURGE = 1.5        # breakout volume vs 20-day average
 
 # Nasdaq-100 constituents change; update this list or swap in your own watchlist.
-TICKERS = [
-    "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG", "AVGO", "TSLA", "COST",
-    "NFLX", "AMD", "PEP", "ADBE", "CSCO", "TMUS", "INTC", "QCOM", "TXN", "AMGN",
-    "INTU", "AMAT", "ISRG", "BKNG", "HON", "LRCX", "VRTX", "ADI", "PANW", "MU",
-    "KLAC", "SBUX", "GILD", "MDLZ", "ADP", "REGN", "SNPS", "CDNS", "MELI", "CRWD",
-    "ORLY", "ABNB", "MRVL", "FTNT", "CSX", "ASML", "PYPL", "MAR", "CTAS", "WDAY",
-]
+TICKERS = ["QQQ"]
 
 
 def rsi(close, n=14):
@@ -123,7 +117,7 @@ def main():
             print(f"skip {tk}: {e}")
 
     if not signals:
-        msg = "No swing setups today."
+        msg = "No QQQ swing setup today."
     else:
         lines = ["**Swing setups (hold 2-5 days)**"]
         for s in signals:
