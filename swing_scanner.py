@@ -1,15 +1,28 @@
 """
-Swing trade scanner for the Nasdaq-100 (QQQ holdings), built for 2-5 day holds.
+Swing trade scanner for QQQ, built for 2-5 day holds, with confluence scoring.
 
 Setup:   pip install yfinance pandas requests
 Run:     python swing_scanner.py
 Best:    run once daily after the close (4:15pm ET), place orders next morning.
 
-It looks for two setups, both only in uptrends:
-  1. PULLBACK: price dips to the 20 EMA, RSI cooled off and turning up
-  2. BREAKOUT: closes above the 20-day high on strong volume
+STEP 1 - a base setup must appear:
+  PULLBACK  (uptrend: price > 50 SMA > 200 SMA) price dips to the 20 EMA,
+            RSI cooled off and turning up
+  BREAKOUT  (same uptrend) closes above the 20-day high on strong volume
+  DIP       price above the 200 SMA and the 2-day RSI is below 10
+            (short-term oversold in a long-term uptrend; a well-known
+            index ETF mean-reversion setup)
 
-Each signal gets an entry, an ATR-based stop, and 1.5R / 3R targets.
+STEP 2 - confluences. Each one that agrees adds a point (max 5). They are
+chosen because each adds different, researched information:
+  1. Momentum: price is higher than it was ~6 months ago (time-series momentum)
+  2. Trend strength: ADX above 20
+  3. Calm market: VIX below 25 (stops get hit far more in panicky markets)
+  4. Not overextended: RSI below 70
+  5. Near highs: price within 5% of its 52-week high
+
+An alert is only sent when score >= MIN_CONFLUENCE.
+Evidence for these ideas is mostly from older data and edges shrink over time.
 This is a screening tool, not advice. Backtest it and paper trade first.
 """
 
@@ -25,9 +38,10 @@ ACCOUNT_SIZE = 10_000  # used for position sizing
 RISK_PER_TRADE = 0.01  # risk 1% of account per trade
 ATR_STOP_MULT = 1.5    # stop = entry - 1.5 * ATR
 VOL_SURGE = 1.5        # breakout volume vs 20-day average
+VIX_MAX = 25           # "calm market" threshold
+MIN_CONFLUENCE = 3     # out of 5; raise for fewer, pickier alerts
 
-# Nasdaq-100 constituents change; update this list or swap in your own watchlist.
-TICKERS = ["QQQ"]
+TICKERS = ["QQQ"]  # add more tickers here any time, e.g. ["QQQ", "SPY"]
 
 
 def rsi(close, n=14):
@@ -37,8 +51,8 @@ def rsi(close, n=14):
     return 100 - 100 / (1 + gain / loss)
 
 
-def atr(df, n=14):
-    tr = pd.concat(
+def true_range(df):
+    return pd.concat(
         [
             df["High"] - df["Low"],
             (df["High"] - df["Close"].shift()).abs(),
@@ -46,11 +60,26 @@ def atr(df, n=14):
         ],
         axis=1,
     ).max(axis=1)
-    return tr.ewm(alpha=1 / n, adjust=False).mean()
 
 
-def analyze(ticker, df):
-    df = df.dropna()
+def atr(df, n=14):
+    return true_range(df).ewm(alpha=1 / n, adjust=False).mean()
+
+
+def adx(df, n=14):
+    up = df["High"].diff()
+    down = -df["Low"].diff()
+    plus_dm = up.where((up > down) & (up > 0), 0.0)
+    minus_dm = down.where((down > up) & (down > 0), 0.0)
+    atr_n = atr(df, n)
+    plus_di = 100 * plus_dm.ewm(alpha=1 / n, adjust=False).mean() / atr_n
+    minus_di = 100 * minus_dm.ewm(alpha=1 / n, adjust=False).mean() / atr_n
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    return dx.ewm(alpha=1 / n, adjust=False).mean()
+
+
+def analyze(ticker, df, vix=None):
+    df = df.dropna().copy()
     if len(df) < 210:
         return None
 
@@ -59,29 +88,41 @@ def analyze(ticker, df):
     df["sma50"] = c.rolling(50).mean()
     df["sma200"] = c.rolling(200).mean()
     df["rsi"] = rsi(c)
+    df["rsi2"] = rsi(c, 2)
     df["atr"] = atr(df)
+    df["adx"] = adx(df)
     df["vol_avg"] = df["Volume"].rolling(20).mean()
     df["high20"] = df["High"].rolling(20).max().shift(1)
+    df["high252"] = df["High"].rolling(252, min_periods=120).max()
+    df["mom126"] = c / c.shift(126) - 1
 
     t, y = df.iloc[-1], df.iloc[-2]
 
-    # Trend filter: only trade longs in uptrends
     uptrend = t.Close > t.sma50 > t.sma200
-    if not uptrend:
+    setup = None
+    if uptrend:
+        touched_ema = t.Low <= t.ema20 * 1.01 and t.Close >= t.ema20
+        if touched_ema and 38 <= t.rsi <= 55 and t.rsi > y.rsi:
+            setup = "PULLBACK"
+        elif t.Close > t.high20 and t.Volume >= VOL_SURGE * t.vol_avg:
+            setup = "BREAKOUT"
+    if not setup and t.Close > t.sma200 and t.rsi2 < 10:
+        setup = "DIP"
+    if not setup:
         return None
 
-    setup = None
-
-    # 1) Pullback to 20 EMA, RSI cooled and ticking up
-    touched_ema = t.Low <= t.ema20 * 1.01 and t.Close >= t.ema20
-    if touched_ema and 38 <= t.rsi <= 55 and t.rsi > y.rsi:
-        setup = "PULLBACK"
-
-    # 2) Breakout above 20-day high on volume
-    elif t.Close > t.high20 and t.Volume >= VOL_SURGE * t.vol_avg:
-        setup = "BREAKOUT"
-
-    if not setup:
+    vix_now = None
+    if vix is not None and len(vix.dropna()):
+        vix_now = float(vix.reindex(df.index).ffill().iloc[-1])
+    hits = {
+        "momentum": bool(t.mom126 > 0),
+        "ADX": bool(t.adx > 20),
+        "calm VIX": bool(vix_now is not None and vix_now < VIX_MAX),
+        "RSI": bool(t.rsi < 70),
+        "near highs": bool(t.Close >= 0.95 * t.high252),
+    }
+    score = sum(hits.values())
+    if score < MIN_CONFLUENCE:
         return None
 
     entry = float(t.Close)
@@ -92,25 +133,32 @@ def analyze(ticker, df):
     return {
         "ticker": ticker,
         "setup": setup,
+        "score": score,
+        "why": ", ".join(k for k, v in hits.items() if v),
         "entry": round(entry, 2),
         "stop": round(stop, 2),
         "target1": round(entry + 1.5 * risk, 2),
         "target2": round(entry + 3.0 * risk, 2),
         "shares": shares,
-        "rsi": round(float(t.rsi), 1),
+        "vix": None if vix_now is None else round(vix_now, 1),
     }
 
 
 def main():
     data = yf.download(
-        TICKERS, period="1y", interval="1d",
+        TICKERS + ["^VIX"], period="2y", interval="1d",
         group_by="ticker", auto_adjust=True, progress=False,
     )
+    try:
+        vix = data["^VIX"]["Close"]
+    except Exception:
+        vix = None
+        print("Warning: could not load VIX; the calm-market point is skipped.")
 
     signals = []
     for tk in TICKERS:
         try:
-            sig = analyze(tk, data[tk].copy())
+            sig = analyze(tk, data[tk].copy(), vix)
             if sig:
                 signals.append(sig)
         except Exception as e:
@@ -122,11 +170,12 @@ def main():
         lines = ["**Swing setups (hold 2-5 days)**"]
         for s in signals:
             lines.append(
-                f"{s['ticker']} | {s['setup']} | buy ~{s['entry']} | "
-                f"stop {s['stop']} | T1 {s['target1']} | T2 {s['target2']} | "
-                f"size {s['shares']} sh | RSI {s['rsi']}"
+                f"{s['ticker']}: {s['setup']} | score {s['score']}/5 ({s['why']})\n"
+                f"Buy near ${s['entry']} | Stop ${s['stop']} | "
+                f"Take profit 1 ${s['target1']} | Take profit 2 ${s['target2']} | "
+                f"Size {s['shares']} sh | VIX {s['vix']}"
             )
-        lines.append("Exit rule: sell at T2, stop, or end of day 5.")
+        lines.append("Exit: take profit 2, the stop, or end of day 5.")
         msg = "\n".join(lines)
 
     print(msg)
